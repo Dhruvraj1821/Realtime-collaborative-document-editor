@@ -2,6 +2,8 @@ import User from "../models/User.js";
 import asyncHandler from "../middleware/asyncHandler.js";
 import { generateAccessToken, generateRefreshToken } from "../utils/token.js";
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
+
 
 export const signup = asyncHandler(async (req, res) => {
   const { name, email, password } = req.body;
@@ -35,24 +37,12 @@ export const login = asyncHandler(async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
-    return res.status(400).json({
-      message: "Email and password are required",
-    });
+    return res.status(400).json({ message: "Email and password required" });
   }
 
   const user = await User.findOne({ email }).select("+password");
-
-  if (!user) {
-    return res.status(401).json({
-      message: "Invalid email or password",
-    });
-  }
-
-  const isMatch = await user.comparePassword(password);
-  if (!isMatch) {
-    return res.status(401).json({
-      message: "Invalid email or password",
-    });
+  if (!user || !(await user.comparePassword(password))) {
+    return res.status(401).json({ message: "Invalid credentials" });
   }
 
   const accessToken = generateAccessToken(user._id);
@@ -61,45 +51,47 @@ export const login = asyncHandler(async (req, res) => {
   user.refreshTokens.push({ token: refreshToken });
   await user.save();
 
-  res.status(200).json({
-    message: "Login successful",
-    accessToken,
-    refreshToken,
-    user: {
-      id: user._id,
-      name: user.name,
-      email: user.email,
-    },
-  });
+  
+  res
+    .cookie("accessToken", accessToken, {
+      httpOnly: false,        
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      maxAge: 15 * 60 * 1000, // 15 minutes
+    })
+    .cookie("refreshToken", refreshToken, {
+      httpOnly: true,         
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    })
+    .status(200)
+    .json({
+      message: "Login successful",
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+      },
+    });
 });
 
+
 export const refreshAccessToken = asyncHandler(async (req, res) => {
-  const { refreshToken } = req.body;
+  const refreshToken = req.cookies.refreshToken;
 
   if (!refreshToken) {
-    return res.status(400).json({
-      message: "Refresh token is required",
-    });
+    return res.status(401).json({ message: "Refresh token missing" });
   }
 
-  let decoded;
-  try {
-    decoded = jwt.verify(
-      refreshToken,
-      process.env.REFRESH_TOKEN_SECRET
-    );
-  } catch (error) {
-    return res.status(401).json({
-      message: "Invalid or expired refresh token",
-    });
-  }
+  const decoded = jwt.verify(
+    refreshToken,
+    process.env.REFRESH_TOKEN_SECRET
+  );
 
   const user = await User.findById(decoded.userId);
-
   if (!user) {
-    return res.status(401).json({
-      message: "User not found",
-    });
+    return res.status(401).json({ message: "User not found" });
   }
 
   const tokenExists = user.refreshTokens.some(
@@ -107,46 +99,127 @@ export const refreshAccessToken = asyncHandler(async (req, res) => {
   );
 
   if (!tokenExists) {
-    return res.status(401).json({
-      message: "Refresh token not recognized",
-    });
+    return res.status(401).json({ message: "Invalid refresh token" });
   }
 
   const newAccessToken = generateAccessToken(user._id);
 
+  res.cookie("accessToken", newAccessToken, {
+    httpOnly: false,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    maxAge: 15 * 60 * 1000,
+  });
+
+  res.status(200).json({ message: "Access token refreshed" });
+});
+
+
+export const logout = asyncHandler(async (req, res) => {
+  const refreshToken = req.cookies.refreshToken;
+
+  if (refreshToken) {
+    const user = await User.findOne({
+      "refreshTokens.token": refreshToken,
+    });
+
+    if (user) {
+      user.refreshTokens = user.refreshTokens.filter(
+        (t) => t.token !== refreshToken
+      );
+      await user.save();
+    }
+  }
+
+  res
+    .clearCookie("accessToken")
+    .clearCookie("refreshToken")
+    .status(200)
+    .json({ message: "Logout successful" });
+});
+
+export const forgotPassword = asyncHandler(async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) {
+    return res.status(400).json({
+      message: "Email is required",
+    });
+  }
+
+  const user = await User.findOne({ email });
+
+  if (!user) {
+    return res.status(200).json({
+      message: "If the email exists, a reset link has been sent",
+    });
+  }
+
+
+  const resetToken = crypto.randomBytes(32).toString("hex");
+
+  const hashedToken = crypto
+    .createHash("sha256")
+    .update(resetToken)
+    .digest("hex");
+
+
+  user.passwordResetToken = hashedToken;
+  user.passwordResetExpires = Date.now() + 15 * 60 * 1000; // 15 minutes
+
+  await user.save();
+
+
+  const resetUrl = `http://localhost:${process.env.PORT}/api/auth/reset-password/${resetToken}`;
+
+  console.log("🔑 PASSWORD RESET URL:");
+  console.log(resetUrl);
+
   res.status(200).json({
-    accessToken: newAccessToken,
+    message: "If the email exists, a reset link has been sent",
   });
 });
 
-export const logout = asyncHandler(async (req, res) => {
-  const { refreshToken } = req.body;
+export const resetPassword = asyncHandler(async (req, res) => {
+  const { token } = req.params;
+  const { newPassword } = req.body;
 
-  if (!refreshToken) {
+  if (!newPassword || newPassword.length < 6) {
     return res.status(400).json({
-      message: "Refresh token is required",
+      message: "Password must be at least 6 characters long",
     });
   }
 
+
+  const hashedToken = crypto
+    .createHash("sha256")
+    .update(token)
+    .digest("hex");
+
   const user = await User.findOne({
-    "refreshTokens.token": refreshToken,
+    passwordResetToken: hashedToken,
+    passwordResetExpires: { $gt: Date.now() },
   });
 
   if (!user) {
-  
-    return res.status(200).json({
-      message: "Logout successful",
+    return res.status(400).json({
+      message: "Invalid or expired reset token",
     });
   }
 
+ 
+  user.password = newPassword;
 
-  user.refreshTokens = user.refreshTokens.filter(
-    (t) => t.token !== refreshToken
-  );
+
+  user.passwordResetToken = undefined;
+  user.passwordResetExpires = undefined;
+
+
+  user.refreshTokens = [];
 
   await user.save();
 
   res.status(200).json({
-    message: "Logout successful",
+    message: "Password reset successful. Please login again.",
   });
 });
